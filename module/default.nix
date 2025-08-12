@@ -92,67 +92,95 @@ with lib; let
     fi
   '';
 
-  activationFileCleanup = isActivation: ''
-    function homeageCleanup() {
-      # oldGenPath and newGenPath come from activation init:
-      # https://github.com/nix-community/home-manager/blob/master/modules/lib-bash/activation-init.sh
-      if [ ! -v oldGenPath ] ; then
-        echo "[homeage] No previous generation: no cleanup needed."
-        return 0
-      fi
-
-      local oldGenFile newGenFile
-      oldGenFile="$oldGenPath/${statePath}"
-      ${
-      lib.optionalString isActivation ''
-        local newGenFile
-        newGenFile="$newGenPath/${statePath}"
-
-        # Technically not possible (state always written if has secrets). Check anyway
-        if [ ! -L "$newGenFile" ]; then
-          echo "[homeage] Activated but no current state" >&2
-          return 1
-        fi
-      ''
-    }
-
-      if [ ! -L "$oldGenFile" ]; then
-        echo "[homeage] No previous homeage state: no cleanup needed"
-        return 0
-      fi
-
-      # Get all changed secrets for cleanup (intersection)
-      ${jq} \
-        --null-input \
-        --compact-output \
-        --slurpfile old "$oldGenFile" \
-        ${
+  activationFileCleanup = isActivation: let
+    # NIX-LEVEL LOGIC: Define the filter string using a proper Nix 'if'.
+    # This resolves the syntax error.
+    jq_filter =
       if isActivation
       then ''
-        --slurpfile new "$newGenFile" \
-        '$old - $new | .[]' |
+        ($old[0] - $new[0])[] |
+          "path \(.path)",
+          (.symlinks[] | "symlink \(.)"),
+          (.copies[] | "copy \(.)"),
+          "END"
       ''
       else ''
-        '$old | .[]' |
-      ''
-    }
-      # Replace $UID with $(id -u). Don't use eval
-      ${pkgs.gnused}/bin/sed \
-        "s/\$UID/$(id -u)/g" |
-      while IFS=$"\n" read -r c; do
-        path=$(echo "$c" | ${jq} --raw-output '.path')
-        symlinks=$(echo "$c" | ${jq} --raw-output '.symlinks[]')
-        copies=$(echo "$c" | ${jq} --raw-output '.copies[]')
+        ($old[0])[] |
+          "path \(.path)",
+          (.symlinks[] | "symlink \(.)"),
+          (.copies[] | "copy \(.)"),
+          "END"
+      '';
 
-        ${cleanupSecret "[homeage] "}
+  in ''
+    # SHELL SCRIPT: Now we build the script with clean variables.
+    function homeageCleanup() {
+      # --- Setup and Guard Clauses ---
+      if [ ! -v oldGenPath ] ; then return 0; fi
+      local oldGenFile="$oldGenPath/${statePath}"
+      if [ ! -L "$oldGenFile" ]; then return 0; fi
+      if ${lib.boolToString isActivation}; then
+        local newGenFile="$newGenPath/${statePath}"
+        if [ ! -L "$newGenFile" ]; then return 1; fi
+      fi
+
+      # --- Main Logic ---
+      # This pipeline is clean and syntax-error free.
+      # It interpolates the jq_filter variable defined correctly above.
+      ${jq} --null-input --raw-output --slurpfile old "$oldGenFile" \
+        ${lib.optionalString isActivation ''--slurpfile new "$newGenFile"''} \
+        '${jq_filter}' |
+      ${pkgs.gnused}/bin/sed "s/\\\$UID/$(id -u)/g" |
+      while IFS=' ' read -r key value; do
+        # Using a case statement to build arrays from the key-value stream.
+        # This is robust and avoids all 'eval' and escaping issues.
+        case "$key" in
+          path)
+            # Start a new secret block
+            path="$value"
+            symlinks=()
+            copies=()
+            ;;
+          symlink)
+            symlinks+=("$value")
+            ;;
+          copy)
+            copies+=("$value")
+            ;;
+          END)
+            # Process the completed secret block
+            local prefix="[homeage] "
+            echo "''${prefix}Cleaning up decrypted secret: $path"
+
+            for symlink in "''${symlinks[@]}"; do
+              if [ ! -L "$symlink" ] || [ ! "$(readlink "$symlink")" == "$path" ]; then continue; fi
+              echo "''${prefix}Removing symlink '$symlink'..."
+              unlink "$symlink"
+              rmdir --ignore-fail-on-non-empty --parents "$(dirname "$symlink")"
+            done
+
+            for copy in "''${copies[@]}"; do
+              if [ ! -f "$path" ]; then continue; fi
+              if ! cmp -s "$copy" "$path"; then continue; fi
+              echo "''${prefix}Removing copied file '$copy'..."
+              rm "$copy"
+              rmdir --ignore-fail-on-non-empty --parents "$(dirname "$copy")"
+            done
+
+            if [ -f "$path" ]; then
+              echo "''${prefix}Removing secret file '$path'..."
+              rm "$path"
+              rmdir --ignore-fail-on-non-empty --parents "$(dirname "$path")"
+            fi
+            ;;
+        esac
       done
+
       echo "[homeage] Finished cleanup of secrets."
     }
 
     homeageCleanup
-  '';
-
-  # Options for a secret file
+  '';  # Options for a secret file
   # Based on https://github.com/ryantm/agenix/pull/58
   secretFile = types.submodule ({name, ...}: {
     options = {
@@ -260,7 +288,7 @@ in {
           assertion = let
             paths = mapAttrsToList (_: value: value.path) cfg.file;
           in
-            (unique paths) == paths;
+          (unique paths) == paths;
           message = "overlapping secret file paths.";
         }
       ];
@@ -285,10 +313,10 @@ in {
           fi
         '';
       in
-        hm.dag.entryBefore ["writeBoundary"] checkDecryptionScript;
-    }
-    (mkIf (cfg.installationType == "activation") {
-      home = {
+      hm.dag.entryBefore ["writeBoundary"] checkDecryptionScript;
+      }
+      (mkIf (cfg.installationType == "activation") {
+        home = {
         # Always write state if activation installation so will
         # cleanup the previous generations when cleanup gets enabled
         # Do not write if systemd installation because cleanup will be done through systemd units
@@ -297,9 +325,9 @@ in {
             pkgs.writeText
             "homeage-state.json"
             (builtins.toJSON
-              (map
-                (secret: secret)
-                (builtins.attrValues cfg.file)));
+            (map
+            (secret: secret)
+            (builtins.attrValues cfg.file)));
         in ''
           mkdir -p $(dirname $out/${statePath})
           ln -s ${stateFile} $out/${statePath}
@@ -309,46 +337,46 @@ in {
           homeageCleanup = let
             fileCleanup = activationFileCleanup true;
           in
-            hm.dag.entryBetween ["homeageDecrypt"] ["writeBoundary"] fileCleanup;
+          hm.dag.entryBetween ["homeageDecrypt"] ["writeBoundary"] fileCleanup;
 
           homeageDecrypt = let
-            activationScript = builtins.concatStringsSep "\n" (lib.attrsets.mapAttrsToList decryptSecret cfg.file);
+          activationScript = builtins.concatStringsSep "\n" (lib.attrsets.mapAttrsToList decryptSecret cfg.file);
           in
-            hm.dag.entryBetween ["reloadSystemd"] ["writeBoundary"] activationScript;
-        };
-      };
-    })
-    (mkIf (cfg.installationType == "systemd") {
+          hm.dag.entryBetween ["reloadSystemd"] ["writeBoundary"] activationScript;
+          };
+          };
+          })
+          (mkIf (cfg.installationType == "systemd") {
       # Need to cleanup secrets if switching from activation -> systemd
       home.activation.homeageCleanup = let
         fileCleanup = activationFileCleanup false;
       in
-        hm.dag.entryAfter ["writeBoundary"] fileCleanup;
+      hm.dag.entryAfter ["writeBoundary"] fileCleanup;
 
       systemd.user.services = let
-        mkServices =
-          lib.attrsets.mapAttrs'
-          (
-            name: value:
-              lib.attrsets.nameValuePair
-              "${name}-secret"
-              {
-                Unit = {
-                  Description = "Decrypt ${name} secret";
-                };
+      mkServices =
+      lib.attrsets.mapAttrs'
+      (
+      name: value:
+      lib.attrsets.nameValuePair
+      "${name}-secret"
+      {
+      Unit = {
+      Description = "Decrypt ${name} secret";
+      };
 
-                Service = {
-                  Type = "oneshot";
-                  Environment = "PATH=${makeBinPath [pkgs.coreutils pkgs.diffutils]}";
-                  ExecStart = "${pkgs.writeShellScript "${name}-decrypt" ''
+      Service = {
+      Type = "oneshot";
+      Environment = "PATH=${makeBinPath [pkgs.coreutils pkgs.diffutils]}";
+      ExecStart = "${pkgs.writeShellScript "${name}-decrypt" ''
                     set -euo pipefail
                     DRY_RUN_CMD=
                     VERBOSE_ARG=
 
                     ${decryptSecret name value}
-                  ''}";
-                  RemainAfterExit = true;
-                  ExecStop = "${pkgs.writeShellScript "${name}-cleanup" ''
+      ''}";
+      RemainAfterExit = true;
+      ExecStop = "${pkgs.writeShellScript "${name}-cleanup" ''
                     set -euo pipefail
 
                     path="${value.path}"
@@ -356,17 +384,17 @@ in {
                     copies=(${builtins.concatStringsSep " " value.copies})
 
                     ${cleanupSecret ""}
-                  ''}";
-                };
+      ''}";
+    };
 
-                Install = {
-                  WantedBy = ["default.target"];
-                };
-              }
-          )
-          cfg.file;
+    Install = {
+      WantedBy = ["default.target"];
+    };
+  }
+  )
+  cfg.file;
       in
-        mkServices;
+      mkServices;
     })
   ]);
 }
