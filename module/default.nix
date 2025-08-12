@@ -113,7 +113,6 @@ with lib; let
       '';
 
   in ''
-    # SHELL SCRIPT: Now we build the script with clean variables.
     function homeageCleanup() {
       # --- Setup and Guard Clauses ---
       if [ ! -v oldGenPath ] ; then return 0; fi
